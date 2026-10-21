@@ -1,7 +1,7 @@
 <br />
 <p align="center">
   <img src="https://raw.githubusercontent.com/Daemacht/io_scene_oblivion/refs/heads/main/_static/logo.png" width="152" height="142">
-  <h2 align="center">Oblivion Blender Plugin</h2>
+  <h2 align="center">Oblivion Blender Plugin (BETA)</h2>
   <p align="center">
     <a href="https://github.com/Daemacht/io_scene_oblivion/">Download</a>
     ·
@@ -12,7 +12,7 @@
 
 ### About The Project
 
-The *Oblivion Blender Plugin* is an open source project with the goal of bringing Oblivion support to modern versions of Blender.
+The *Oblivion Blender Plugin* is an open source project with the goal of bringing Oblivion support to modern versions of Blender. The plugin is not yet complete or fully tested yet, expect possible issues.
 
 
 ### Requirements
@@ -24,3 +24,6 @@ The *Oblivion Blender Plugin* is an open source project with the goal of bringin
 ### Installation
 
 - Get the latest `io_scene_oblivion.zip` from the [releases](https://github.com/Daemacht/io_scene_oblivion/releases) page and install via Blender interface: `Edit->Preferences->Add-ons->Install...`
+- 
+### Todo
+Animation support
