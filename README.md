@@ -18,8 +18,6 @@ The *Oblivion Blender Plugin* is an open source project with the goal of bringin
 ### Requirements
 
 - **Blender 4.0 (64-bit)** or newer (untested). Available on the [official Blender download page](https://blender.org/download/).
-- **Windows Users** will need the [Microsoft Visual Studio 2019 Redistributable (x64)](https://aka.ms/vs/16/release/vc_redist.x64.exe) package.
-
 
 ### Installation
 
