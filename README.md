@@ -22,6 +22,10 @@ The *Oblivion Blender Plugin* is an open source project with the goal of bringin
 ### Installation
 
 - Get the latest `io_scene_oblivion.zip` from the [releases](https://github.com/Daemacht/io_scene_oblivion/releases) page and install via Blender interface: `Edit->Preferences->Add-ons->Install...`
-- 
+  
 ### Todo
-Animation support
+Add particles support
+Gamebryo version 10.2 nifs
+.egm
+.tri
+And more
