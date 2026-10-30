@@ -305,4 +305,7 @@ def build_scene(desc, context, settings):
         if od.hidden:
             obj.hide_set(True)
         created.append(obj)
+    if getattr(desc, 'actions', None):
+        from . import blender_anim
+        desc.warnings.extend(blender_anim.build_actions(desc, objects, context, settings))
     return created

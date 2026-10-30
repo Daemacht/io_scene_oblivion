@@ -37,6 +37,8 @@ class ImportSettings:
     import_hidden: bool = True
     find_normal_maps: bool = True      # look for <name>_n.dds next to the diffuse
     import_empties: bool = True        # keep NiNode hierarchy as empties
+    import_animation: bool = True      # NiControllerManager sequences / node controllers -> actions
+    anim_fps: float = 30.0             # frames per second used to convert key times
 
 
 # --------------------------------------------------------------- description
@@ -151,10 +153,48 @@ class ObjDesc:
 
 
 @dataclass
+class KeyTrack:
+    """Keys of one animated quantity.  ``times`` in seconds, ``values`` shaped (n, k)."""
+    times: np.ndarray
+    values: np.ndarray
+    interp: str = 'LINEAR'                         # LINEAR | BEZIER | CONSTANT
+    fwd: Optional[np.ndarray] = None               # (n, k) outgoing tangents, value per second (BEZIER)
+    bwd: Optional[np.ndarray] = None               # (n, k) incoming tangents
+
+
+@dataclass
+class ChannelDesc:
+    kind: str                                      # TRANSFORM | BONE | MATERIAL_COLOR | MATERIAL_ALPHA | VISIBILITY
+    target: 'ObjDesc'
+    bone: Optional[str] = None
+    loc: Optional[KeyTrack] = None                 # (n,3) Blender units
+    quat: Optional[KeyTrack] = None                # (n,4) w x y z
+    euler: Optional[list] = None                   # three scalar KeyTracks (x, y, z), radians
+    scale: Optional[KeyTrack] = None               # (n,1) or (n,3)
+    values: Optional[KeyTrack] = None              # colours (n,3) / alpha (n,1) / visibility (n,1)
+    slot: str = ''                                 # material colour slot: ambient diffuse specular emissive
+
+
+@dataclass
+class ActionDesc:
+    name: str
+    channels: list = field(default_factory=list)
+    start: float = 0.0
+    stop: float = 0.0
+    frequency: float = 1.0
+    cycle: str = 'LOOP'                            # LOOP | REVERSE | CLAMP
+    weight: float = 1.0
+    accum_root: str = ''
+    text_keys: list = field(default_factory=list)  # [(time, text)]
+    props: dict = field(default_factory=dict)
+
+
+@dataclass
 class SceneDesc:
     objects: List[ObjDesc] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
+    actions: list = field(default_factory=list)
 
 
 # ------------------------------------------------------------------- helpers
@@ -370,6 +410,12 @@ class SceneBuilder:
         if self.s.import_collision:
             for r in roots:
                 self._emit_collision_tree(r)
+        if self.s.import_animation:
+            try:
+                from .nif_anim import AnimImporter
+                AnimImporter(self).run()
+            except Exception as e:                                          # noqa: BLE001
+                self.warn.append('Animation import failed: %s: %s' % (type(e).__name__, e))
         st = self.scene.stats
         st['objects'] = len(self.scene.objects)
         st['meshes'] = sum(1 for o in self.scene.objects if o.kind == 'MESH' and o.collection == 'main')
@@ -603,6 +649,14 @@ class SceneBuilder:
             elif e.btype == 'BSBound':
                 obj.props['nif_bsbound'] = ' '.join('%.9g' % x for x in (*e['Center'], *e['Dimensions']))
         obj.props['nif_block'] = blk.btype
+        obj.props['nif_flags'] = int(blk['Flags'])
+        if blk.is_a('NiGeometry'):                           # vanilla meshes without a normal map carry no tangent data
+            obj.props['nif_tangents'] = int(any(e.btype == 'NiBinaryExtraData' and str(e['Name']).startswith('Tangent space')
+                                                for e in self.refs(blk['Extra Data List'])))
+        if 'Properties' in blk:
+            for pr in self.refs(blk['Properties']):
+                if pr.btype == 'NiVertexColorProperty':
+                    obj.props['nif_vcprop'] = '%d %d %d' % (int(pr['Flags']), int(pr['Vertex Mode']), int(pr['Lighting Mode']))
 
     # ---- bones ---------------------------------------------------------------
     def _make_bones(self, sr, bones):
@@ -955,9 +1009,10 @@ class SceneBuilder:
                 p['nif_hk_material'] = int(mat['Material'] if hasattr(mat, 'items') else mat)
             if shape is not None and shape.btype == 'bhkMoppBvTreeShape':
                 packed = self.d(shape['Shape'])
+                code = shape['MOPP Code']
+                v = f = weld = None
                 if packed is not None and packed.btype == 'bhkPackedNiTriStripsShape':
                     data = self.d(packed['Data'])
-                    code = shape['MOPP Code']
                     if data is not None and len(code['Data']):
                         tr = data['Triangles']
                         if isinstance(tr, np.ndarray) and tr.dtype.names:
@@ -971,13 +1026,29 @@ class SceneBuilder:
                         v = np.asarray(data['Vertices'], dtype=np.float32).reshape(-1, 3)
                         if sc:
                             v = (v * np.array([sc['x'], sc['y'], sc['z']])).astype(np.float32)
-                        off = code['Offset']
-                        p['nif_mopp_data'] = base64.b64encode(bytes(code['Data'])).decode('ascii')
-                        p['nif_mopp_offset'] = ' '.join('%.9g' % off[k] for k in ('x', 'y', 'z', 'w'))
-                        p['nif_mopp_scale'] = float(shape['Scale'])
-                        p['nif_mopp_unused'] = bytes(shape['Unused 01']).hex()
-                        p['nif_mopp_verts'] = base64.b64encode(v.tobytes()).decode('ascii')
-                        p['nif_mopp_faces'] = hashlib.sha1(f.tobytes()).hexdigest()
+                elif packed is not None and packed.btype == 'bhkNiTriStripsShape' and len(packed['Strips Data']) == 1 \
+                        and len(code['Data']):
+                    sd = self.d(packed['Strips Data'][0])
+                    if sd is not None and sd.is_a('NiTriStripsData'):
+                        pts = [np.asarray(x, dtype='<u2') for x in sd['Points']]
+                        v = np.asarray(sd['Vertices'], dtype=np.float32).reshape(-1, 3)
+                        f = strips_to_triangles(pts).astype(np.int32).reshape(-1, 3)
+                        p['nif_mopp_kind'] = 'STRIPS'
+                        p['nif_mopp_points'] = base64.b64encode(np.concatenate(pts).tobytes()).decode('ascii')
+                        p['nif_mopp_striplens'] = base64.b64encode(np.array([len(x) for x in pts], dtype='<u2').tobytes()).decode('ascii')
+                        p['nif_mopp_shape_unused'] = bytes(packed['Unused 01']).hex()
+                        p['nif_mopp_radius'] = float(packed['Radius'])
+                        sc = packed['Scale']
+                        p['nif_mopp_sscale'] = ' '.join('%.9g' % sc[k] for k in ('x', 'y', 'z', 'w'))
+                if v is not None:
+                    off = code['Offset']
+                    p['nif_mopp_data'] = base64.b64encode(bytes(code['Data'])).decode('ascii')
+                    p['nif_mopp_offset'] = ' '.join('%.9g' % off[k] for k in ('x', 'y', 'z', 'w'))
+                    p['nif_mopp_scale'] = float(shape['Scale'])
+                    p['nif_mopp_unused'] = bytes(shape['Unused 01']).hex()
+                    p['nif_mopp_verts'] = base64.b64encode(v.tobytes()).decode('ascii')
+                    p['nif_mopp_faces'] = hashlib.sha1(f.tobytes()).hexdigest()
+                    if weld is not None:
                         p['nif_mopp_weld'] = base64.b64encode(np.asarray(weld, dtype='<u2').tobytes()).decode('ascii')
         except Exception as e:                                              # noqa: BLE001
             self.warn.append('Some Havok properties could not be read (%s)' % e)

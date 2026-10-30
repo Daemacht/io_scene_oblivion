@@ -32,6 +32,11 @@ class IMPORT_OT_oblivion_nif(bpy.types.Operator, ImportHelper):
                                    description="Use <texture>_n.dds next to the diffuse texture if it exists")
     import_collision: BoolProperty(name="Havok Collision", default=False,
                                    description="Import collision shapes as wire objects in a 'Collision' collection")
+    import_animation: BoolProperty(name="Keyframe Animation", default=True,
+                                   description="Import NiControllerManager sequences (and plain node controllers) as "
+                                               "Actions: transforms, material colours, alpha and visibility")
+    anim_fps: FloatProperty(name="Animation FPS", default=30.0, min=1.0, max=240.0,
+                            description="Frames per second used to convert key times to frames (sets the scene FPS)")
     import_empties: BoolProperty(name="Keep NiNode Hierarchy", default=True,
                                  description="Create empties for NiNodes")
 
@@ -40,7 +45,8 @@ class IMPORT_OT_oblivion_nif(bpy.types.Operator, ImportHelper):
             scale=self.scale, texture_dir=self.texture_dir, import_collision=self.import_collision,
             import_skeleton=self.import_skeleton, import_normals=self.import_normals,
             import_vertex_colors=self.import_vertex_colors, find_normal_maps=self.find_normal_maps,
-            import_empties=self.import_empties)
+            import_empties=self.import_empties,
+            import_animation=self.import_animation, anim_fps=self.anim_fps)
         paths = [os.path.join(self.directory, f.name) for f in self.files] if self.files else [self.filepath]
         total = 0
         for path in paths:
@@ -79,6 +85,11 @@ class EXPORT_OT_oblivion_nif(bpy.types.Operator, ExportHelper):
         description="Export meshes in the 'Collision' collection (or with a nif_collision property) as Havok "
                     "collision. Unedited imported meshes keep their original MOPP; new or edited meshes use "
                     "bhkNiTriStripsShape. Set the custom property nif_collision to BOX, SPHERE, CAPSULE, CONVEX or MESH")
+    export_animation: BoolProperty(
+        name="Keyframe Animation", default=True,
+        description="Export Actions as NiControllerManager sequences (object / bone transforms, material colour and "
+                    "alpha, visibility). Actions imported from a NIF keep their sequence name, cycle type, text keys "
+                    "(pose markers) etc.; any other Action becomes a sequence named after the Action")
     tangents: EnumProperty(
         name="Tangent Space", default='AUTO',
         items=[('AUTO', "Auto", "Write tangent space whenever the mesh has UVs and normals (what Oblivion meshes normally carry)"),
@@ -98,13 +109,13 @@ class EXPORT_OT_oblivion_nif(bpy.types.Operator, ExportHelper):
         try:
             objs = blender_export.collect(context, dict(
                 selected_only=self.selected_only, normals=self.export_normals, colors=self.export_vertex_colors,
-                collision=self.export_collision))
+                collision=self.export_collision, animation=self.export_animation))
             if not objs:
                 self.report({'ERROR'}, "Nothing to export (select objects or disable 'Selected Only')")
                 return {'CANCELLED'}
             data, warnings = nif_export.export_bytes(
                 objs, nif_export.ExportSettings(scale=self.scale, tangents=self.tangents, prn=self.prn,
-                                          collision=self.export_collision))
+                                          collision=self.export_collision, animation=self.export_animation))
         except nif_export.NifExportError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
@@ -112,6 +123,9 @@ class EXPORT_OT_oblivion_nif(bpy.types.Operator, ExportHelper):
             fh.write(data)
         for w in warnings:
             self.report({'WARNING'}, w)
+        if self.export_animation and getattr(objs, 'actions', None):
+            self.report({'INFO'}, "Exported %d animation sequence(s): %s" % (
+                len(objs.actions), ", ".join(a.name for a in objs.actions[:6])))
         self.report({'INFO'}, "Exported %s (%d bytes)" % (os.path.basename(self.filepath), len(data)))
         return {'FINISHED'}
 

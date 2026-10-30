@@ -290,12 +290,20 @@ class CollisionExporter:
             return None
         if kind == 'BOX':
             ctr, R, half = fit_box(hv * HAVOK_SCALE)
+            aligned = np.abs(R).round()
+            if np.allclose(np.abs(R), aligned, atol=1e-4) and np.allclose(aligned.sum(0), 1) and np.allclose(aligned.sum(1), 1):
+                half = np.array([half[int(np.argmax(aligned[i]))] for i in range(3)])      # axis-aligned: reorder, drop R
+                R = np.eye(3)
             box = b.add('bhkBoxShape', **{'Material': self.mat(material), 'Radius': 0.1, 'Unused 01': BOX_UNUSED,
                                           'Dimensions': _v3(half / HAVOK_SCALE), 'Unused Float': float(half.min() / HAVOK_SCALE)})
+            if np.allclose(R, np.eye(3), atol=1e-4) and np.allclose(ctr, 0, atol=1e-3):
+                return box                                  # centred box: no transform wrapper (as in vanilla)
             return self.convex_transform(box, R, ctr / HAVOK_SCALE, material)
         if kind == 'SPHERE':
             ctr, r = fit_sphere(hv)
             sph = b.add('bhkSphereShape', **{'Material': self.mat(material), 'Radius': float(r)})
+            if np.allclose(ctr, 0, atol=1e-3):
+                return sph
             return self.convex_transform(sph, np.eye(3), ctr, material)
         if kind == 'CAPSULE':
             cap = fit_capsule(hv)
@@ -344,6 +352,8 @@ class CollisionExporter:
             b.warnings.append(raise_)
             return None
         if mopp_matches(c.props, hv, F):
+            if c.props.get('nif_mopp_kind') == 'STRIPS':
+                return self.mopp_strips(c, material, layer)
             weld = np.frombuffer(base64.b64decode(c.props['nif_mopp_weld']), dtype='<u2') if 'nif_mopp_weld' in c.props else None
             if weld is None or len(weld) != len(F):
                 weld = np.zeros(len(F), dtype=np.uint16)
@@ -360,12 +370,7 @@ class CollisionExporter:
                 'Sub Shapes': [{'Havok Filter': self.filt(layer), 'Num Vertices': len(hv), 'Material': self.mat(material)}],
                 'User Data': 0, 'Unused 01': bytes(4), 'Radius': 0.1, 'Unused 02': bytes(4),
                 'Scale': _v4((1, 1, 1)), 'Radius Copy': 0.1, 'Scale Copy': _v4((1, 1, 1)), 'Data': data.index})
-            off = [float(x) for x in c.props['nif_mopp_offset'].split()]
-            code = base64.b64decode(c.props['nif_mopp_data'])
-            return b.add('bhkMoppBvTreeShape', **{
-                'Shape': packed.index, 'Unused 01': bytes.fromhex(c.props.get('nif_mopp_unused', MOPP_UNUSED.hex())),
-                'Scale': float(c.props.get('nif_mopp_scale', 1.0)),
-                'MOPP Code': {'Data Size': len(code), 'Offset': _v4(off[:3], off[3]), 'Data': code}})
+            return self.mopp(packed, c.props)
         b.warnings.append("Collision mesh has no valid MOPP (new or edited): exported as bhkNiTriStripsShape. "
                           "This works in-game but is slower than a MOPP-based shape.")
         strip = self.strip(F)
@@ -382,6 +387,42 @@ class CollisionExporter:
             'Material': self.mat(material), 'Radius': 0.1, 'Unused 01': bytes(20), 'Grow By': 1,
             'Scale': _v4((1, 1, 1)), 'Num Strips Data': 1, 'Strips Data': np.array([sd.index], dtype=np.int32),
             'Num Filters': 1, 'Filters': [self.filt(layer)]})
+
+    def mopp(self, child, props):
+        off = [float(x) for x in props['nif_mopp_offset'].split()]
+        code = base64.b64decode(props['nif_mopp_data'])
+        return self.b.add('bhkMoppBvTreeShape', **{
+            'Shape': child.index, 'Unused 01': bytes.fromhex(props.get('nif_mopp_unused', MOPP_UNUSED.hex())),
+            'Scale': float(props.get('nif_mopp_scale', 1.0)),
+            'MOPP Code': {'Data Size': len(code), 'Offset': _v4(off[:3], off[3]), 'Data': code}})
+
+    def mopp_strips(self, c, material, layer):
+        """Untouched imported bhkMoppBvTreeShape(bhkNiTriStripsShape): the MOPP indexes the triangles in strip order, so the
+        original vertices and strips are written back verbatim."""
+        b, props = self.b, c.props
+        v = np.frombuffer(base64.b64decode(props['nif_mopp_verts']), dtype='<f4').reshape(-1, 3)
+        pts = np.frombuffer(base64.b64decode(props['nif_mopp_points']), dtype='<u2')
+        lens = np.frombuffer(base64.b64decode(props['nif_mopp_striplens']), dtype='<u2')
+        strips, at = [], 0
+        for n in lens:
+            strips.append(pts[at:at + int(n)].copy())
+            at += int(n)
+        ctr = (v.min(0) + v.max(0)) / 2
+        rad = float(np.linalg.norm(v - ctr, axis=1).max())
+        sd = b.add('NiTriStripsData', **{
+            'Group ID': 0, 'Num Vertices': len(v), 'Keep Flags': 0, 'Compress Flags': 0, 'Has Vertices': True,
+            'Vertices': v.astype(np.float32), 'Data Flags': 0, 'Has Normals': False,
+            'Bounding Sphere': {'Center': _v3(ctr), 'Radius': rad}, 'Has Vertex Colors': False,
+            'Consistency Flags': 0x4000, 'Additional Data': -1,
+            'Num Triangles': int(sum(max(int(n) - 2, 0) for n in lens)), 'Num Strips': len(strips),
+            'Strip Lengths': lens.astype(np.uint16), 'Has Points': True, 'Points': strips})
+        sc = [float(x) for x in props.get('nif_mopp_sscale', '1 1 1 0').split()]
+        shape = b.add('bhkNiTriStripsShape', **{
+            'Material': self.mat(material), 'Radius': float(props.get('nif_mopp_radius', 0.1)),
+            'Unused 01': bytes.fromhex(props.get('nif_mopp_shape_unused', bytes(20).hex())), 'Grow By': 1,
+            'Scale': _v4(sc[:3], sc[3]), 'Num Strips Data': 1, 'Strips Data': np.array([sd.index], dtype=np.int32),
+            'Num Filters': 1, 'Filters': [self.filt(layer)]})
+        return self.mopp(shape, props)
 
     # -- rigid body
     def make_body(self, shape, props, layer, hv, faces, body_M):

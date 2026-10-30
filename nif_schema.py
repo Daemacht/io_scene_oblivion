@@ -2840,7 +2840,7 @@ OBJECTS = {'AbstractAdditionalGeometryData': {'fields': [], 'inherit': 'NiObject
                               {'n': 'Planar Angle Variation', 't': 'float'}, {'n': 'Initial Color', 't': 'Color4'},
                               {'n': 'Initial Radius', 't': 'float'}, {'n': 'Radius Variation', 'since': 168034305, 't': 'float'},
                               {'n': 'Life Span', 't': 'float'}, {'n': 'Life Span Variation', 't': 'float'},
-                              {'len': '2', 'n': 'Unknown QQSpeed Floats', 't': 'float'}],
+                              {'len': '2', 'n': 'Unknown QQSpeed Floats', 'since': 335676423, 't': 'float', 'until': 335676423}],
                    'inherit': 'NiPSysModifier'},
  'NiPSysEmitterCtlr': {'fields': [{'n': 'Data', 't': 'Ref', 'tpl': 'NiPSysEmitterCtlrData', 'until': 167837799},
                                   {'n': 'Visibility Interpolator', 'since': 167837800, 't': 'Ref', 'tpl': 'NiInterpolator'}],

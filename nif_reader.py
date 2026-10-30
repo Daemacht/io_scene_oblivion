@@ -77,7 +77,7 @@ class _Field:
 
 
 def _comp(expr):
-    return compile(expr, '<nif>', 'eval') if expr is not None else None
+    return compile(expr.strip(), '<nif>', 'eval') if expr is not None else None
 
 
 class Reader:
@@ -199,7 +199,7 @@ class Reader:
         fmt, _dt = _BASIC[t]
         v = self._unpack(fmt, _BASIC_SIZE[t])
         if t == 'bool':
-            return bool(v)
+            return bool(v) if v < 2 else int(v)      # keep odd values (e.g. 2) so files round-trip exactly
         return v
 
     def read_array(self, t, n, tpl, arg, arg2=0):

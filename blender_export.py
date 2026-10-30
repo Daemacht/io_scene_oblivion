@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Reads Blender objects into :class:`nif_scene.ObjDesc` for :mod:`nif_export` (Blender 4.0 API)."""
 import os
+import re
 
 import bpy
 import numpy as np
 from mathutils import Matrix
 
 from . import nif_scene as SC
+from . import anim_collect as AC
+from .nif_export import ObjList
 
 EXPORT_TYPES = {'MESH', 'EMPTY', 'ARMATURE'}
 
@@ -297,6 +300,183 @@ def _mat(m):
     return np.array([list(r) for r in m], dtype=np.float64)
 
 
+# ------------------------------------------------------------------ animation
+_BONE_RE = re.compile(r'^pose\.bones\["(.+?)"\]\.(.+)$')
+_NODE_RE = re.compile(r'^nodes\["(.+?)"\]\.inputs\[(\d+)\]\.default_value$')
+_XFORM = ('location', 'rotation_euler', 'rotation_quaternion', 'scale')
+
+
+def _raw_curve(fc):
+    kps = fc.keyframe_points
+    n = len(kps)
+    co = np.empty(n * 2)
+    kps.foreach_get('co', co)
+    hl = np.empty(n * 2)
+    kps.foreach_get('handle_left', hl)
+    hr = np.empty(n * 2)
+    kps.foreach_get('handle_right', hr)
+    co, hl, hr = co.reshape(-1, 2), hl.reshape(-1, 2), hr.reshape(-1, 2)
+    return AC.RawCurve(co[:, 0].copy(), co[:, 1].copy(), [kp.interpolation for kp in kps], hl, hr)
+
+
+def _curves_of(act):
+    """{data_path: {index: RawCurve}}, plus whether any curve cycles."""
+    out, cyc = {}, False
+    for fc in act.fcurves:
+        if fc.mute or len(fc.keyframe_points) == 0:
+            continue
+        out.setdefault(fc.data_path, {})[fc.array_index] = _raw_curve(fc)
+        cyc = cyc or any(m.type == 'CYCLES' for m in fc.modifiers)
+    return out, cyc
+
+
+def _candidates(o, notes):
+    """(action, material or None) pairs that animate object ``o``."""
+    out, seen = [], set()
+
+    def add(act, mat):
+        if act is not None and (act.name, mat.name if mat else None) not in seen:
+            seen.add((act.name, mat.name if mat else None))
+            out.append((act, mat))
+
+    ad = o.animation_data
+    if ad is not None:
+        add(ad.action, None)
+    mats = [s.material for s in o.material_slots if s.material]
+    for m in mats:
+        nt = m.node_tree
+        if nt is not None and nt.animation_data is not None:
+            add(nt.animation_data.action, m)
+    for act in bpy.data.actions:                         # sequences not currently assigned (imported actions)
+        if 'nif_sequence' not in act:
+            continue
+        t = act.get('nif_target')
+        if t == o.name or (t is None and act.name.endswith('_' + o.name)):
+            add(act, None)
+        for m in mats:
+            if t == o.name or (t is None and act.name.endswith('_' + m.name)):
+                if any(fc.data_path.startswith('nodes[') for fc in act.fcurves):
+                    add(act, m)
+    return out
+
+
+def _rest_of(b):
+    return {'location': tuple(b.location), 'rotation_euler': tuple(b.rotation_euler),
+            'rotation_quaternion': tuple(b.rotation_quaternion), 'scale': tuple(b.scale),
+            'rotation_mode': b.rotation_mode}
+
+
+def collect_actions(context, objs, descs, pieces, scale_of, skinned, chosen):
+    """Blender actions -> list of nif_scene.ActionDesc (one per sequence name) + warnings."""
+    scene = context.scene
+    r = getattr(scene, 'render', None)
+    fps = (r.fps / (r.fps_base or 1.0)) if r is not None else 30.0
+    W = []
+    groups = {}
+    done_mats = set()
+    seen_ch = set()
+
+    def add_ch(ad, ch, act):
+        # several actions can claim the same node of a sequence (e.g. leftovers of repeated imports): keep the first
+        key = (ad.name, id(ch.target), ch.kind, ch.bone, ch.slot)
+        if key in seen_ch:
+            msg = "Animation '%s': ignored duplicate action '%s' for '%s'." % (ad.name, act.name, ch.target.name)
+            if msg not in W:
+                W.append(msg)
+            return
+        seen_ch.add(key)
+        ad.channels.append(ch)
+
+    for o in objs:
+        for act, mat in _candidates(o, W):
+            seq = str(act.get('nif_sequence', act.name))
+            curves, cyc = _curves_of(act)
+            if not curves:
+                continue
+            if 'nif_start' in act:
+                f0, start, stop = 0.0, float(act['nif_start']), float(act.get('nif_stop', 0.0))
+            else:
+                lo, hi = act.frame_range
+                f0, start, stop = float(lo), 0.0, (float(hi) - float(lo)) / fps
+            ad = groups.get(seq)
+            if ad is None:
+                markers = [((m.frame - f0) / fps, m.name) for m in act.pose_markers]
+                if not markers and act.get('nif_text_keys'):
+                    for line in str(act['nif_text_keys']).splitlines():
+                        t, _, txt = line.partition('|')
+                        try:
+                            markers.append((float(t), txt))
+                        except ValueError:
+                            pass
+                ad = groups[seq] = SC.ActionDesc(
+                    seq, start=start, stop=stop, frequency=float(act.get('nif_frequency', 1.0)),
+                    cycle=str(act['nif_cycle']) if 'nif_cycle' in act else ('LOOP' if cyc else 'CLAMP'),
+                    weight=float(act.get('nif_weight', 1.0)), accum_root=str(act.get('nif_accum_root', '')),
+                    text_keys=sorted(markers))
+            ad.stop = max(ad.stop, stop)
+            lab = '%s/%s' % (seq, o.name)
+            xform = {k: v for k, v in curves.items() if k in _XFORM}
+            if xform:
+                if o in skinned:
+                    W.append("Animation of skinned mesh '%s' was skipped (animate its armature instead)." % o.name)
+                else:
+                    par = o.parent
+                    pinv = np.array([list(r) for r in o.matrix_parent_inverse])
+                    if par is not None and par not in chosen:
+                        pinv = np.array([list(r) for r in par.matrix_world]) @ pinv
+                    for p in pieces.get(o, []):
+                        ch = AC.object_channel(p, xform, _rest_of(o), fps, f0, scale_of.get(o), pinv, W, lab)
+                        if ch is not None:
+                            add_ch(ad, ch, act)
+            if o.type == 'ARMATURE':
+                for name in sorted({m.group(1) for m in (_BONE_RE.match(k) for k in curves) if m}):
+                    pb = o.pose.bones.get(name)
+                    if pb is None:
+                        continue
+                    ch = AC.bone_channel(descs[o], name, curves, _rest_of(pb), fps, f0, W, lab + '/' + name)
+                    if ch is not None:
+                        add_ch(ad, ch, act)
+            vis = curves.get('hide_viewport') or curves.get('hide_render')
+            if vis and 0 in vis and o.type == 'MESH':
+                for p in pieces.get(o, []):
+                    ch = AC.values_channel('VISIBILITY', p, [vis[0]], [float(o.hide_viewport)], fps, f0, warnings=W,
+                                           label=lab, invert=True)
+                    if ch is not None:
+                        add_ch(ad, ch, act)
+            if o.type == 'MESH' and mat is not None and mat.node_tree is not None and (act.name, mat.name) not in done_mats:
+                done_mats.add((act.name, mat.name))
+                target = next((p for p in pieces.get(o, []) if p.xmesh is not None and p.xmesh.material is not None
+                               and p.xmesh.material.name == mat.name), None)
+                if target is None:
+                    continue
+                per_node = {}
+                for path, d in curves.items():
+                    m = _NODE_RE.match(path)
+                    if m:
+                        node = mat.node_tree.nodes.get(m.group(1))
+                        if node is not None:
+                            per_node.setdefault((node.name, int(m.group(2))), {}).update(d)
+                for (nname, idx), d in per_node.items():
+                    sock = list(mat.node_tree.nodes.get(nname).inputs)[idx]
+                    base = list(sock.default_value) if hasattr(sock.default_value, '__len__') else [sock.default_value]
+                    if sock.name == 'Alpha':
+                        ch = AC.values_channel('MATERIAL_ALPHA', target, [d.get(0)], [base[0]], fps, f0, warnings=W, label=lab)
+                    elif sock.name in ('Emission Color', 'Base Color'):
+                        ch = AC.values_channel('MATERIAL_COLOR', target, [d.get(i) for i in range(3)], base[:3], fps, f0,
+                                               slot='emissive' if sock.name == 'Emission Color' else 'diffuse',
+                                               warnings=W, label=lab)
+                    else:
+                        W.append("Animated material input '%s' of '%s' has no NIF equivalent; skipped." % (sock.name, o.name))
+                        continue
+                    if ch is not None:
+                        add_ch(ad, ch, act)
+            unknown = [k for k in curves if not (k in _XFORM or k in ('hide_viewport', 'hide_render') or
+                                                 _BONE_RE.match(k) or _NODE_RE.match(k))]
+            if unknown:
+                W.append("Animation '%s': F-curve '%s' (and %d more) cannot be exported." % (seq, unknown[0], len(unknown) - 1))
+    return [g for g in groups.values() if g.channels], W
+
+
 def collect(context, settings):
     """Blender objects -> list of ObjDesc (export side)."""
     objs = gather_objects(context, settings['selected_only'], settings.get('hidden', False))
@@ -320,9 +500,11 @@ def collect(context, settings):
             d.props = {k: o[k] for k in o.keys() if k.startswith('nif_') and isinstance(o[k], (int, float, str))}
         descs[o] = d
         order.append((o, d))
-    result = []
+    result = ObjList()
+    pieces, scale_of, skinned = {}, {}, set()
     for o, d in order:
         if o.type != 'MESH':
+            pieces[o] = [d]
             parent = o.parent if o.parent in chosen else None
             d.parent = descs.get(parent)
             rel = (parent.matrix_world.inverted() @ o.matrix_world) if parent else o.matrix_world
@@ -335,6 +517,10 @@ def collect(context, settings):
         loc, rot, sc = rel.decompose()
         M = _mat(Matrix.LocRotScale(loc, rot, None))      # scale is baked into the vertices instead
         xs = mesh_to_xmeshes(o, context, settings, arm_obj, mat_cache, sc)
+        pieces[o] = []
+        scale_of[o] = np.array([sc.x, sc.y, sc.z])
+        if arm_obj is not None:
+            skinned.add(o)
         for k, xm in enumerate(xs):
             dd = d if k == 0 else SC.ObjDesc(xm.name, 'MESH', np.eye(4), props=dict(d.props))
             dd.name = xm.name
@@ -342,6 +528,7 @@ def collect(context, settings):
             dd.matrix = M
             dd.parent = descs.get(parent)
             dd.armature = descs.get(arm_obj) if arm_obj is not None else None
+            pieces[o].append(dd)
             result.append(dd)
     if settings.get('collision', True):
         for o in gather_collision(context, settings['selected_only'], chosen):
@@ -364,4 +551,6 @@ def collect(context, settings):
             d.xcoll = SC.ExportCollision(SC.COLLISION_KINDS.get(str(props.get('nif_collision', 'MESH')), 'MESH'),
                                          verts, tri.reshape(-1, 3), props)
             result.append(d)
+    if settings.get('animation', True):
+        result.actions, result.warnings = collect_actions(context, objs, descs, pieces, scale_of, skinned, chosen)
     return result

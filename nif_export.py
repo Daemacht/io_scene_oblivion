@@ -7,6 +7,7 @@ Blender).  No ``bpy`` here, so it is unit-testable.
 Output NIF: version 20.0.0.5, user version 11, BS version 11.
 """
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,6 +15,7 @@ import numpy as np
 from .nif_reader import Block
 from .nif_scene import MaterialDesc, ExportMesh, bone_axis_matrix
 from .nif_collision import CollisionExporter
+from .nif_animexport import AnimExporter
 from .nif_writer import new_block, nif_bytes
 
 MAX_BONES_PER_PARTITION = 18
@@ -24,6 +26,12 @@ class NifExportError(Exception):
     pass
 
 
+class ObjList(list):
+    """List of ObjDesc plus the ActionDescs to export (``.actions``)."""
+    actions = ()
+    warnings = ()
+
+
 @dataclass
 class ExportSettings:
     scale: float = 0.1                # NIF -> Blender scale used on import (positions are divided by this)
@@ -31,6 +39,7 @@ class ExportSettings:
     author: str = 'Blender Oblivion NIF exporter'
     collision: bool = True            # export Havok collision helpers
     prn: str = 'NONE'                 # weapon/armour attach point: NONE BACK SIDE QUIVER SHIELD HELM RING
+    animation: bool = True            # export keyframe animation (NiControllerManager)
 
 
 # ------------------------------------------------------------------- helpers
@@ -196,6 +205,8 @@ class ExportBuilder:
         self.bone_blocks = {}      # (armature id, bone name) -> NiNode block
         self.bone_rest = {}        # (armature id, bone name) -> 4x4 NIF rest matrix in skeleton space
         self.arm_block = {}        # id(armature obj) -> NiNode block
+        self._vc_props = {}
+        self.shape_of = {}         # id(ObjDesc) -> (shape block, NiMaterialProperty block or None)
 
     def add(self, btype, **fields):
         b = new_block(btype, **fields)
@@ -204,7 +215,7 @@ class ExportBuilder:
         return b
 
     # ---- common AV object fields ------------------------------------------
-    def av_fields(self, name, M4, extras=(), props=(), flags=14):
+    def av_fields(self, name, M4, extras=(), props=(), flags=6):
         return dict(**{'Name': name,
                        'Num Extra Data List': len(extras),
                        'Extra Data List': np.array([e.index for e in extras], dtype=np.int32),
@@ -216,7 +227,15 @@ class ExportBuilder:
                        'Properties': np.array([p.index for p in props], dtype=np.int32),
                        'Collision Object': -1})
 
-    def node_fields(self, name, M4, extras=(), flags=14):
+    @staticmethod
+    def flags_for(o, default):
+        """Node flags: the imported value (nif_flags) or the vanilla default."""
+        try:
+            return int(o.props.get('nif_flags', default))
+        except (TypeError, ValueError):
+            return default
+
+    def node_fields(self, name, M4, extras=(), flags=6):
         d = self.av_fields(name, M4, extras, (), flags)
         d.update({'Num Children': 0, 'Children': np.zeros(0, np.int32), 'Num Effects': 0,
                   'Effects': np.zeros(0, np.int32)})
@@ -267,6 +286,7 @@ class ExportBuilder:
 
     # ---- main --------------------------------------------------------------
     def build(self):
+        self.warnings.extend(getattr(self.objs, 'warnings', ()))
         objs = [o for o in self.objs if o.collection == 'main']
         self.colls = [o for o in self.objs if o.collection == 'collision' and o.xcoll is not None] if self.s.collision else []
         self.has_collision = bool(self.colls)
@@ -282,10 +302,14 @@ class ExportBuilder:
             self.fill_container(root, tops[0], is_root=True)
         else:
             root = self.add('NiNode')
-            root.update(self.node_fields('Scene Root', np.eye(4), self.extra_blocks(tops[0], True), 2))
+            root.update(self.node_fields('Scene Root', np.eye(4), self.extra_blocks(tops[0], True),
+                                         2 if any(o.kind == 'ARMATURE' for o in objs) else 6))
             kids = [k for k in (self.emit_obj(o) for o in tops) if k is not None]
             self.set_children(root, kids)
         self.export_collision(root)
+        actions = getattr(self.objs, 'actions', None)
+        if actions and self.s.animation:
+            AnimExporter(self, root, actions).run()
         return self.blocks, [root]
 
     def export_collision(self, root):
@@ -304,7 +328,8 @@ class ExportBuilder:
 
     def fill_container(self, node, obj, is_root=False):
         M = to_nif_matrix(obj.matrix, self.inv)
-        node.update(self.node_fields(obj.name or 'Scene Root', M, self.extra_blocks(obj, is_root), 2 if is_root else 14))
+        node.update(self.node_fields(obj.name or 'Scene Root', M, self.extra_blocks(obj, is_root),
+                                     self.flags_for(obj, 2 if obj.kind == 'ARMATURE' else 6)))
         self.node_of[id(obj)] = node
         kids = self.emit_children(obj, node)
         self.set_children(node, kids)
@@ -325,13 +350,15 @@ class ExportBuilder:
     def emit_obj(self, o):
         if o.kind == 'EMPTY':
             node = self.add('NiNode')
-            node.update(self.node_fields(o.name, to_nif_matrix(o.matrix, self.inv), self.extra_blocks(o)))
+            node.update(self.node_fields(o.name, to_nif_matrix(o.matrix, self.inv), self.extra_blocks(o),
+                                         self.flags_for(o, 6)))
             self.node_of[id(o)] = node
             self.set_children(node, self.emit_children(o, node))
             return node
         if o.kind == 'ARMATURE':
             node = self.add('NiNode')
-            node.update(self.node_fields(o.name, to_nif_matrix(o.matrix, self.inv), self.extra_blocks(o), 2))
+            node.update(self.node_fields(o.name, to_nif_matrix(o.matrix, self.inv), self.extra_blocks(o),
+                                         self.flags_for(o, 2)))
             self.node_of[id(o)] = node
             self.set_children(node, self.emit_children(o, node))
             return node
@@ -378,7 +405,7 @@ class ExportBuilder:
         if md.specular_enabled:
             props.append(self.add('NiSpecularProperty', **self.prop_base('', Flags=1)))
         props.append(self.add('NiMaterialProperty', **self.prop_base(
-            md.name, **{'Ambient Color': dict(r=md.ambient[0], g=md.ambient[1], b=md.ambient[2]),
+            re.sub(r'\.\d{3}$', '', md.name), **{'Ambient Color': dict(r=md.ambient[0], g=md.ambient[1], b=md.ambient[2]),
                         'Diffuse Color': dict(r=md.diffuse[0], g=md.diffuse[1], b=md.diffuse[2]),
                         'Specular Color': dict(r=md.specular[0], g=md.specular[1], b=md.specular[2]),
                         'Emissive Color': dict(r=md.emissive[0], g=md.emissive[1], b=md.emissive[2]),
@@ -478,16 +505,28 @@ class ExportBuilder:
 
         center = (verts.min(0) + verts.max(0)) / 2
         radius = float(np.linalg.norm(verts - center, axis=1).max())
-        data = self.add('NiTriShapeData')
-        data.update({
+        skinned = bool(xm.weights and o.armature is not None)
+        # vanilla statics are NiTriStrips (one stitched strip); skinned meshes and meshes imported as NiTriShape stay NiTriShape
+        use_strips = not skinned and str(o.props.get('nif_block', 'NiTriStrips')) != 'NiTriShape' and len(tris) > 0
+        base = {
             'Group ID': 0, 'Num Vertices': nv, 'Keep Flags': 0, 'Compress Flags': 0, 'Has Vertices': True,
             'Vertices': verts.astype(np.float32), 'Data Flags': len(uv_arrays),
             'Has Normals': normals is not None,
             'Bounding Sphere': {'Center': vec(center), 'Radius': radius},
             'Has Vertex Colors': colors is not None,
-            'Consistency Flags': 0x4000, 'Additional Data': -1,
-            'Num Triangles': len(tris), 'Num Triangle Points': len(tris) * 3, 'Has Triangles': True,
-            'Triangles': tris.astype(np.uint16), 'Num Match Groups': 0, 'Match Groups': []})
+            'Consistency Flags': 0 if (use_strips and colors is not None) else 0x4000, 'Additional Data': -1}
+        if use_strips:
+            strip = strip_from_triangles(tris)
+            data = self.add('NiTriStripsData')
+            data.update(base)
+            data.update({'Num Triangles': len(strip) - 2, 'Num Strips': 1,
+                         'Strip Lengths': np.array([len(strip)], dtype=np.uint16), 'Has Points': True,
+                         'Points': [strip.astype(np.uint16)]})
+        else:
+            data = self.add('NiTriShapeData')
+            data.update(base)
+            data.update({'Num Triangles': len(tris), 'Num Triangle Points': len(tris) * 3, 'Has Triangles': True,
+                         'Triangles': tris.astype(np.uint16), 'Num Match Groups': 0, 'Match Groups': []})
         if normals is not None:
             data['Normals'] = normals.astype(np.float32)
         if colors is not None:
@@ -497,7 +536,7 @@ class ExportBuilder:
 
         # ---- tangent space extra data
         extras = []
-        want = self.s.tangents != 'NEVER'  # 'AUTO' = always when UVs + normals exist (as the 2.49 exporter did)
+        want = self.s.tangents != 'NEVER' and int(o.props.get('nif_tangents', 1)) != 0  # 'AUTO' = always when UVs + normals exist (as the 2.49 exporter did)
         if want and normals is not None and uv_arrays and len(tris):
             t, b = compute_tangents(verts, normals, uv_arrays[0], tris)
             # bitangents first, then tangents (verified on vanilla meshes)
@@ -507,11 +546,26 @@ class ExportBuilder:
                 'Binary Data': {'Data Size': len(blob), 'Data': blob}}))
 
         extras += self.extra_blocks(o)
-        props = self.material_blocks(md)
-        shape = self.add('NiTriShape')
+        props = list(self.material_blocks(md))
+        vc = None
+        if 'nif_vcprop' in o.props:                          # imported values (vanilla meshes differ: 0/0/0 or 0/2/1)
+            try:
+                vc = tuple(int(x) for x in str(o.props['nif_vcprop']).split()[:3])
+            except ValueError:
+                vc = None
+        if vc is None and use_strips and colors is not None:  # vanilla statics with baked vertex colours
+            vc = (0, 2, 1)
+        if vc is not None and not skinned:
+            if vc not in self._vc_props:
+                self._vc_props[vc] = self.add('NiVertexColorProperty', **self.prop_base(
+                    '', Flags=vc[0], **{'Vertex Mode': vc[1], 'Lighting Mode': vc[2]}))
+            tex = [p for p in props if p.btype == 'NiTexturingProperty']
+            props = tex + [self._vc_props[vc]] + [p for p in props if p.btype != 'NiTexturingProperty']
+        shape = self.add('NiTriStrips' if use_strips else 'NiTriShape')
         M = to_nif_matrix(o.matrix, self.inv)
-        shape.update(self.av_fields(o.name, M, extras, props, 0 if (xm.weights and o.armature is not None) else 14))
+        shape.update(self.av_fields(o.name, M, extras, props, 0 if skinned else self.flags_for(o, 6)))
         shape.update({'Data': data.index, 'Skin Instance': -1, 'Material Data': {'Has Shader': False}})
+        self.shape_of[id(o)] = (shape, next((p for p in props if p.btype == 'NiMaterialProperty'), None))
 
         if xm.weights and o.armature is not None:
             self.make_skin(shape, o, xm, M, verts, cv[src_corner], tris)
